@@ -62,13 +62,15 @@ def write_line(p, tokens):
     # 姓名是完整 token，行末放不下时，在姓名前插入 Word 软换行。
     used = 0
     line = []
-    for s, atomic in tokens:
+    def width_of(text):
+        return sum(0.5 if c.isascii() and (c == " " or c.isdigit()) else 1 for c in text)
+
+    for i, (s, atomic) in enumerate(tokens):
         for chunk in ([s] if atomic else s):
-            width = sum(0.5 if c.isascii() and (c == " " or c.isdigit())
-                        else 1 for c in chunk)
+            width = width_of(chunk)
             if width > 24:
                 raise ValueError(f"单个姓名超过正文行宽，请核对：{s}")
-            if used + width > 24:
+            if used + width > 24 and chunk != "；":
                 p.add_run("".join(line).rstrip()).add_break()
                 line.clear()
                 used = 0
@@ -76,13 +78,28 @@ def write_line(p, tokens):
                 continue
             line.append(chunk)
             used += width
+        if s == "；":
+            next_width = 0
+            for j in range(i + 1, len(tokens)):
+                if tokens[j][0] == "；":
+                    break
+                next_width += width_of(tokens[j][0])
+            if used + next_width > 24:
+                p.add_run("".join(line)).add_break()
+                line.clear()
+                used = 0
     p.add_run("".join(line))
 
 
-def details(rows, prefix="", include_issue=True, include_date=False):
+def time_label(r):
+    return day(r.get("date")) or r.get("period", "")
+
+
+def details(rows, prefix="", include_issue=True, include_date=False, include_room=False):
     tokens = [(prefix, False)]
     for i, r in enumerate(rows):
-        fields = [day(r.get("date")) if include_date else "", r.get("bed", "")]
+        fields = [time_label(r) if include_date else "", r.get("room", "") if include_room else "",
+                  r.get("bed", "")]
         parts = [(v, False) for v in fields if v]
         parts.extend((name_token(n), True) for n in r.get("names", []))
         if include_issue:
@@ -101,61 +118,112 @@ def grouped(rows, key):
     return groups
 
 
-def section_lines(section, rows, problem_groups):
-    if rows == []:
+def evening_groups(records, dated):
+    # 先按人员归集，再合列问题完全相同的人员。地点、床位或检查批次不同要分开。
+    issues = defaultdict(list)
+    order = []
+    for i, r in enumerate(records):
+        location = (r.get("room", ""), r.get("bed", ""), r.get("check", ""))
+        if not r.get("names"):
+            order.append((None, r))
+            continue
+        for name in r["names"]:
+            key = (location, name, None if dated or r.get("check") else i)
+            if key not in issues:
+                order.append((key, r))
+            issues[key].append(r["issue"])
+
+    groups = []
+    by_problems = {}
+    for key, r in order:
+        if key is None:
+            groups.append(r)
+            continue
+        location, name, batch = key
+        problems = tuple(issues[key])
+        group_key = (location, batch, problems)
+        if group_key not in by_problems:
+            group = dict(r, names=[], issue="、".join(problems))
+            groups.append(group)
+            by_problems[group_key] = group
+        by_problems[group_key]["names"].append(name)
+    return groups
+
+
+def separated(clauses, prefix=""):
+    tokens = [(prefix, False)]
+    for i, clause in enumerate(clauses):
+        if i:
+            tokens.append(("；", False))
+        tokens.extend(clause)
+    return tokens
+
+
+def section_lines(section, rows):
+    if not rows:
         raise ValueError(f"{section} 空列表含义不明，已确认无问题请填“无”")
+    normalized = []
+    shared_findings = set()
     for r in rows:
         if not r["issue"].strip() or not isinstance(r.get("names", []), list):
             raise ValueError(f"{section} 的问题或姓名格式有误")
-        if section == "晚自习" and not r.get("date"):
-            raise ValueError("晚自习记录缺少日期")
         day(r.get("date"))
-    rows = sorted(rows, key=lambda r: class_key(r["class"]))
+        classes = sorted({"".join(class_parts(c)) for c in r["class"].split("、")}, key=class_key)
+        if section in ("宿舍卫生", "宿舍安全") and len(classes) > 1:
+            finding = (tuple(classes), r["room"], r.get("date"), r.get("period"), r.get("check"),
+                       r.get("bed"), tuple(sorted(r.get("names", []))), r["issue"])
+            if finding in shared_findings:
+                continue
+            shared_findings.add(finding)
+        normalized.append(dict(r, **{"class": "、".join(classes)}))
+    rows = sorted(normalized, key=lambda r: class_key(r["class"]))
+    if section == "晚自习":
+        batches = defaultdict(list)
+        for r in rows:
+            dt = r.get("date") or ""
+            batches[(dt, "" if dt else r.get("period", ""))].append(r)
+        for (dt, period), items in sorted(batches.items(), key=lambda pair: (not pair[0][0], pair[0])):
+            heading = day(dt) or period
+            if heading or len(batches) > 1:
+                yield [((heading or "具体日期未注明") + "：", False)]
+            for cls, records in grouped(items, "class").items():
+                clauses = (details([g], include_room=True) for g in evening_groups(records, bool(dt)))
+                yield separated(clauses, class_label(cls) + "：")
+        return
     if section == "时政学习":
         tokens = []
         for cls, items in grouped(rows, "class").items():
             if tokens:
                 tokens.append(("；", False))
-            tokens.extend(details(items, class_label(cls) + "：", include_date=True))
+            tokens.extend(separated((details([r], include_date=True, include_room=True) for r in items),
+                                    class_label(cls) + "："))
         yield tokens
         return
     if section in ("宿舍卫生", "宿舍安全", "教室卫生"):
         for cls, items in grouped(rows, "class").items():
+            yield [(class_label(cls) + "：", False)]
             for room, records in grouped(items, "room").items():
                 if not room.strip():
                     raise ValueError(f"{section} 缺少地点")
-                prefix = class_label(cls) + "：" + room
                 if section == "宿舍卫生":
-                    for r in records:
-                        yield details([r], prefix + " ", include_date=True)
+                    # 每个子句自带床位及责任人，不跨检查合并床位。
+                    clauses = (details([r], include_date=True) for r in records)
+                    yield separated(clauses, room + "：")
                 else:
-                    yield [(prefix, False)]
+                    yield [(room + "：", False)]
                     for r in records:
                         yield details([r], include_date=True)
         return
-    batches = sorted(grouped(rows, "date").items()) if section == "晚自习" else [("", rows)]
-    for dt, items in batches:
-        if dt:
-            yield [(day(dt) + "：", False)]
-        by_issue = grouped(items, "issue")
-        selected = (sorted(by_issue, key=lambda s: {"旷操": 0, "迟到": 1}.get(s, 2))
-                    if section == "早操" else [s for s in problem_groups if s in by_issue])
-        for issue in selected:
-            yield [(issue + "：", False)]
-            for cls, records in grouped(by_issue[issue], "class").items():
-                label = class_label(cls) + "："
-                if section == "晚自习":
-                    yield [(label, False)]
-                    label = ""
-                # 日期、床位等细节属于各自记录；仅纯名单可拼在同一行。
-                if all(r.get("names") and not r.get("bed") and (dt or not r.get("date")) for r in records):
-                    yield details(records, label, include_issue=False)
-                else:
-                    for r in records:
-                        yield details([r], label, include_issue=False, include_date=not dt)
-        for r in items:
-            if r["issue"] not in selected:
-                yield details([r], class_label(r["class"]) + "：")
+    by_issue = grouped(rows, "issue")
+    for issue in sorted(by_issue, key=lambda s: {"旷操": 0, "迟到": 1}.get(s, 2)):
+        yield [(issue + "：", False)]
+        for cls, records in grouped(by_issue[issue], "class").items():
+            label = class_label(cls) + "："
+            if all(r.get("names") and not r.get("room") and not r.get("bed") and not time_label(r) for r in records):
+                yield details(records, label, include_issue=False)
+            else:
+                for r in records:
+                    yield details([r], label, include_issue=False, include_date=True, include_room=True)
 
 
 def build(data, folder):
@@ -182,13 +250,16 @@ def build(data, folder):
         for run in p.runs:
             run._r.insert(0, deepcopy(prototype.runs[0]._r.rPr))
 
-    for section in SECTIONS:
+    section_order = data.get("section_order", SECTIONS)
+    if len(section_order) != len(SECTIONS) or set(section_order) != set(SECTIONS):
+        raise ValueError("版式样表的板块顺序须完整列出六项，每项一次")
+    for section in section_order:
         rows = data["sections"][section]
         if rows == "无":
             insert(head, [(section + "：无", False)])
             continue
         insert(head, [(section + "：", False)], True)
-        for tokens in section_lines(section, rows, data.get("problem_groups", [])):
+        for tokens in section_lines(section, rows):
             insert(body, tokens, len(tokens) == 1 and tokens[0][0].endswith("："))
     for p in (head, body):
         p._p.getparent().remove(p._p)
