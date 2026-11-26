@@ -9,6 +9,7 @@ from pathlib import Path
 
 from docx import Document
 from docx.oxml.ns import qn
+from docx.shared import Pt
 from docx.text.paragraph import Paragraph
 
 
@@ -57,7 +58,7 @@ def name_token(name):
     return name
 
 
-def write_line(p, tokens):
+def write_line(p, tokens, class_label_font=None):
     # 16 磅正文可用约 25.9 个全角字。留出字体替换和标点压缩的余量。
     # 姓名是完整 token，行末放不下时，在姓名前插入 Word 软换行。
     used = 0
@@ -65,12 +66,31 @@ def write_line(p, tokens):
     def width_of(text):
         return sum(0.5 if c.isascii() and (c == " " or c.isdigit()) else 1 for c in text)
 
+    line_width = 24
+    if class_label_font is not None:
+        (label, _), *tokens = tokens
+        indent_chars = max(6, width_of(label) + 0.5)
+        # 多班并列的标签过宽时独占首行，给名单留出足够宽度。
+        separate = indent_chars > line_width / 2
+        if separate:
+            indent_chars = 1
+        indent = Pt(indent_chars * class_label_font)
+        fmt = p.paragraph_format
+        fmt.left_indent = indent
+        fmt.first_line_indent = -indent
+        if separate:
+            p.add_run(label).add_break()
+        else:
+            fmt.tab_stops.add_tab_stop(indent)
+            p.add_run(label + "\t")
+        line_width -= indent_chars
+
     for i, (s, atomic) in enumerate(tokens):
         for chunk in ([s] if atomic else s):
             width = width_of(chunk)
             if width > 24:
                 raise ValueError(f"单个姓名超过正文行宽，请核对：{s}")
-            if used + width > 24 and chunk != "；":
+            if used and used + width > line_width and chunk != "；":
                 p.add_run("".join(line).rstrip()).add_break()
                 line.clear()
                 used = 0
@@ -84,7 +104,7 @@ def write_line(p, tokens):
                 if tokens[j][0] == "；":
                     break
                 next_width += width_of(tokens[j][0])
-            if used + next_width > 24:
+            if used + next_width > line_width:
                 p.add_run("".join(line)).add_break()
                 line.clear()
                 used = 0
@@ -209,6 +229,15 @@ def section_lines(section, rows):
                     # 每个子句自带床位及责任人，不跨检查合并床位。
                     clauses = (details([r], include_date=True) for r in records)
                     yield separated(clauses, room + "：")
+                elif section == "宿舍安全":
+                    clauses = []
+                    for r in records:
+                        clause = details([r])
+                        when = time_label(r)
+                        if when:
+                            clause.append((f"（{when}）", False))
+                        clauses.append(clause)
+                    yield separated(clauses, room + "：")
                 else:
                     yield [(room + "：", False)]
                     for r in records:
@@ -239,14 +268,15 @@ def build(data, folder):
     title.runs[0].text = f"第{week}周通报"
     signature_date.runs[0].text = f"{issued.year}年{issued.month}月{issued.day}日"
 
-    def insert(prototype, tokens, keep=False):
+    def insert(prototype, tokens, keep=False, hanging_class=False):
         element = deepcopy(prototype._p)
         element.attrib.pop(qn("w14:paraId"), None)
         head._p.addprevious(element)
         p = Paragraph(element, head._parent)
         p.clear()
         p.paragraph_format.keep_with_next = keep
-        write_line(p, tokens)
+        label_font = prototype.runs[0].font.size.pt if hanging_class else None
+        write_line(p, tokens, class_label_font=label_font)
         for run in p.runs:
             run._r.insert(0, deepcopy(prototype.runs[0]._r.rPr))
 
@@ -260,7 +290,8 @@ def build(data, folder):
             continue
         insert(head, [(section + "：", False)], True)
         for tokens in section_lines(section, rows):
-            insert(body, tokens, len(tokens) == 1 and tokens[0][0].endswith("："))
+            heading = len(tokens) == 1 and tokens[0][0].endswith("：")
+            insert(body, tokens, heading, hanging_class=section == "晚自习" and not heading)
     for p in (head, body):
         p._p.getparent().remove(p._p)
     output = folder / f"工程机械学院{grade}级第{week}周通报.docx"
