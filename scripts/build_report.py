@@ -221,7 +221,9 @@ def section_lines(section, rows):
         return
     if section in ("宿舍卫生", "宿舍安全", "教室卫生"):
         for cls, items in grouped(rows, "class").items():
-            yield [(class_label(cls) + "：", False)]
+            label = class_label(cls) + "："
+            if section != "宿舍安全":
+                yield [(label, False)]
             for room, records in grouped(items, "room").items():
                 if not room.strip():
                     raise ValueError(f"{section} 缺少地点")
@@ -230,14 +232,17 @@ def section_lines(section, rows):
                     clauses = (details([r], include_date=True) for r in records)
                     yield separated(clauses, room + "：")
                 elif section == "宿舍安全":
-                    clauses = []
                     for r in records:
-                        clause = details([r])
+                        tokens = [(label + room, False)]
+                        for name in r.get("names", []):
+                            tokens.extend([(" ", False), (name_token(name), True)])
+                        if r.get("bed"):
+                            tokens.append((" " + r["bed"], False))
+                        tokens.append((" " + r["issue"], False))
                         when = time_label(r)
                         if when:
-                            clause.append((f"（{when}）", False))
-                        clauses.append(clause)
-                    yield separated(clauses, room + "：")
+                            tokens.append((f"（{when}）", False))
+                        yield tokens
                 else:
                     yield [(room + "：", False)]
                     for r in records:
