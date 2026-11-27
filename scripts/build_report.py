@@ -269,15 +269,18 @@ def build(data, folder):
     if set(data["sections"]) != set(SECTIONS):
         raise ValueError("六个板块必须齐全；缺表请先核实")
     doc = Document(TEMPLATE)
-    _, title, _, _, head, body, *_, signature_date = doc.paragraphs
+    slots = {p.text: p for p in doc.paragraphs if p.text.startswith("{{")}
+    title = slots["{{周标题}}"]
+    signature_date = slots["{{日期}}"]
+    anchor = slots["{{板块}}"]
     title.runs[0].text = f"第{week}周通报"
     signature_date.runs[0].text = f"{issued.year}年{issued.month}月{issued.day}日"
 
     def insert(prototype, tokens, keep=False, hanging_class=False):
         element = deepcopy(prototype._p)
         element.attrib.pop(qn("w14:paraId"), None)
-        head._p.addprevious(element)
-        p = Paragraph(element, head._parent)
+        anchor._p.addprevious(element)
+        p = Paragraph(element, anchor._parent)
         p.clear()
         p.paragraph_format.keep_with_next = keep
         label_font = prototype.runs[0].font.size.pt if hanging_class else None
@@ -289,6 +292,8 @@ def build(data, folder):
     if len(section_order) != len(SECTIONS) or set(section_order) != set(SECTIONS):
         raise ValueError("版式样表的板块顺序须完整列出六项，每项一次")
     for section in section_order:
+        head = slots["{{宿舍板块}}"] if section in ("宿舍卫生", "宿舍安全") else anchor
+        body = slots["{{明细}}"] if section == "晚自习" else slots["{{固定行距明细}}"]
         rows = data["sections"][section]
         if rows == "无":
             insert(head, [(section + "：无", False)])
@@ -297,7 +302,7 @@ def build(data, folder):
         for tokens in section_lines(section, rows):
             heading = len(tokens) == 1 and tokens[0][0].endswith("：")
             insert(body, tokens, heading, hanging_class=section == "晚自习" and not heading)
-    for p in (head, body):
+    for p in (anchor, slots["{{明细}}"], slots["{{宿舍板块}}"], slots["{{固定行距明细}}"]):
         p._p.getparent().remove(p._p)
     output = folder / f"工程机械学院{grade}级第{week}周通报.docx"
     with output.open("xb") as f:
